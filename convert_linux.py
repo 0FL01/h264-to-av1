@@ -273,6 +273,19 @@ def format_duration(seconds: float) -> str:
         return f"{secs}с"
 
 
+def format_eta(seconds: float) -> str:
+    """Форматирование ETA в компактный вид HH:MM:SS или MM:SS"""
+    total = max(0, int(round(seconds)))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
+
+
 def print_video_info(info: VideoInfo):
     """Вывод информации о видео"""
     print(f"\n{Colors.BLUE}📹 Информация о видео:{Colors.RESET}")
@@ -358,6 +371,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         # Парсим прогресс
         duration_us = video_info.duration * 1_000_000
         last_progress = -1
+        last_speed: Optional[float] = None
         
         for line in current_process.stdout:
             if conversion_state == ConversionState.CANCELLED:
@@ -368,14 +382,36 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
             if line.startswith('out_time_us='):
                 try:
                     current_us = int(line.split('=')[1])
+                    processed_sec = current_us / 1_000_000
                     if duration_us > 0:
                         progress = min(100, int((current_us / duration_us) * 100))
                         if progress != last_progress:
                             last_progress = progress
+                            eta_text = ""
+                            speed_text = ""
+                            
+                            if last_speed is not None:
+                                remaining = max(video_info.duration - processed_sec, 0.0)
+                                eta_seconds = remaining / max(last_speed, 0.01)
+                                eta_text = f" ETA {format_eta(eta_seconds)}"
+                                speed_text = f" @ {last_speed:.2f}x"
+                            
                             bar_width = 40
                             filled = int(bar_width * progress / 100)
                             bar = '█' * filled + '░' * (bar_width - filled)
-                            print(f"\r   {Colors.CYAN}[{bar}] {progress:3d}%{Colors.RESET}", end='', flush=True)
+                            print(
+                                f"\r   {Colors.CYAN}[{bar}] {progress:3d}%{eta_text}{speed_text}{Colors.RESET}",
+                                end='',
+                                flush=True
+                            )
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith('speed='):
+                try:
+                    speed_str = line.split('=')[1].strip()
+                    if speed_str.endswith('x'):
+                        speed_str = speed_str[:-1]
+                    last_speed = float(speed_str)
                 except (ValueError, IndexError):
                     pass
             elif line.startswith('progress=end'):
