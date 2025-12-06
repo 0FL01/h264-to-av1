@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-H264 to AV1 Converter with VAAPI Hardware Encoding
-Автоматическая конвертация видео с адаптивным битрейтом и аппаратным ускорением.
+H264 to AV1 Converter with VAAPI Hardware Encoding (Docker Runtime)
+Автоматическая конвертация видео с адаптивным битрейтом через Docker контейнер.
 """
 
 import os
@@ -17,6 +17,10 @@ from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
 from collections import deque
+
+# Docker image для ffmpeg
+DOCKER_IMAGE = "linuxserver/ffmpeg:8.0.1"
+VAAPI_DEVICE = "/dev/dri/renderD128"
 
 # ANSI цвета для красивого вывода
 class Colors:
@@ -76,7 +80,7 @@ def signal_handler(signum, frame):
     
     conversion_state = ConversionState.CANCELLED
     
-    # Завершаем текущий процесс ffmpeg
+    # Завершаем текущий процесс docker/ffmpeg
     if current_process and current_process.poll() is None:
         current_process.terminate()
         try:
@@ -108,37 +112,99 @@ def print_banner():
     banner = f"""
 {Colors.CYAN}╔══════════════════════════════════════════════════════════════╗
 ║  {Colors.BOLD}H264 → AV1 Converter{Colors.RESET}{Colors.CYAN}                                        ║
-║  {Colors.DIM}VAAPI Hardware Accelerated Encoding{Colors.RESET}{Colors.CYAN}                         ║
+║  {Colors.DIM}VAAPI Hardware Accelerated (Docker){Colors.RESET}{Colors.CYAN}                        ║
 ╚══════════════════════════════════════════════════════════════╝{Colors.RESET}
 """
     print(banner)
 
 
-def run_command(cmd: list[str], capture_output: bool = True) -> subprocess.CompletedProcess:
-    """Запуск команды с обработкой ошибок"""
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=capture_output,
-            text=True,
-            check=False
-        )
-        return result
-    except FileNotFoundError:
-        print(f"{Colors.RED}Ошибка: команда '{cmd[0]}' не найдена. Убедитесь, что ffmpeg установлен.{Colors.RESET}")
-        sys.exit(1)
+class DockerFFmpegRunner:
+    """Обёртка для запуска ffmpeg/ffprobe через Docker"""
+    
+    def __init__(self, image: str = DOCKER_IMAGE, vaapi_device: str = VAAPI_DEVICE):
+        self.image = image
+        self.vaapi_device = vaapi_device
+        self.cache_dir = Path.home() / ".cache" / "mesa"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _get_docker_base_cmd(self) -> list[str]:
+        """Базовая команда Docker с пробросом устройств"""
+        return [
+            'docker', 'run', '--rm',
+            '--device', self.vaapi_device,
+            '-e', 'XDG_CACHE_HOME=/tmp/cache',
+            '-v', f'{self.cache_dir}:/tmp/cache',
+        ]
+    
+    def _map_path_to_container(self, host_path: Path) -> tuple[str, str]:
+        """
+        Маппинг пути хоста в контейнер.
+        Возвращает: (volume_mount, container_path)
+        """
+        abs_path = host_path.resolve()
+        parent_dir = abs_path.parent
+        filename = abs_path.name
+        container_dir = f"/data/{hash(str(parent_dir)) % 10000}"
+        return f"{parent_dir}:{container_dir}", f"{container_dir}/{filename}"
+    
+    def run_ffprobe(self, file_path: Path) -> subprocess.CompletedProcess:
+        """Запуск ffprobe через Docker"""
+        volume_mount, container_path = self._map_path_to_container(file_path)
+        
+        cmd = self._get_docker_base_cmd() + [
+            '-v', volume_mount,
+            '--entrypoint', 'ffprobe',
+            self.image,
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format', '-show_streams',
+            container_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            return result
+        except FileNotFoundError:
+            print(f"{Colors.RED}Ошибка: Docker не найден. Установите Docker.{Colors.RESET}")
+            sys.exit(1)
+    
+    def build_ffmpeg_cmd(
+        self,
+        source_path: Path,
+        output_path: Path,
+        ffmpeg_args: list[str]
+    ) -> tuple[list[str], str, str]:
+        """
+        Формирует команду Docker run для ffmpeg.
+        Возвращает: (полная команда, container_input_path, container_output_path)
+        """
+        source_mount, container_source = self._map_path_to_container(source_path)
+        output_mount, container_output = self._map_path_to_container(output_path)
+        
+        # Собираем уникальные маунты
+        mounts = [source_mount]
+        if output_mount not in mounts:
+            mounts.append(output_mount)
+        
+        cmd = self._get_docker_base_cmd()
+        for mount in mounts:
+            cmd.extend(['-v', mount])
+        
+        cmd.append(self.image)
+        # ENTRYPOINT уже ffmpeg, добавляем аргументы
+        cmd.extend(ffmpeg_args)
+        
+        return cmd, container_source, container_output
+
+
+# Глобальный экземпляр Docker runner
+docker_runner = DockerFFmpegRunner()
 
 
 def get_video_info(file_path: Path) -> Optional[VideoInfo]:
-    """Получение информации о видеофайле через ffprobe"""
-    cmd = [
-        'ffprobe', '-v', 'quiet',
-        '-print_format', 'json',
-        '-show_format', '-show_streams',
-        str(file_path)
-    ]
+    """Получение информации о видеофайле через ffprobe (Docker)"""
+    result = docker_runner.run_ffprobe(file_path)
     
-    result = run_command(cmd)
     if result.returncode != 0:
         return None
     
@@ -310,7 +376,7 @@ def print_conversion_params(target_br: int, max_br: int, buf_size: int, gop_size
 
 def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -> ConversionResult:
     """
-    Конвертация видео H264 → AV1 с использованием VAAPI.
+    Конвертация видео H264 → AV1 с использованием VAAPI через Docker.
     """
     global current_temp_file, current_process, conversion_state
     # Храним хвост stdout/stderr, чтобы не блокировать ffmpeg и показать ошибку при сбое
@@ -326,20 +392,28 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     current_temp_file = temp_path
     conversion_state = ConversionState.IN_PROGRESS
     
-    # Формируем команду ffmpeg
-    cmd = [
-        'ffmpeg',
+    # Формируем аргументы ffmpeg (без самого ffmpeg - он в ENTRYPOINT)
+    ffmpeg_args = [
         '-hide_banner',
-        '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
-        '-i', str(source_path),
+        '-init_hw_device', f'vaapi=va:{VAAPI_DEVICE}',
+        '-hwaccel', 'vaapi',
+        '-hwaccel_device', VAAPI_DEVICE,
+        '-hwaccel_output_format', 'vaapi',
         '-filter_hw_device', 'va',
-        '-map', '0', 
+    ]
+    
+    # Путь к файлу будет подставлен Docker runner
+    # Здесь placeholder, который заменится
+    ffmpeg_args.extend(['-i', '__INPUT__'])
+    
+    ffmpeg_args.extend([
+        '-map', '0',
         # Matroska не принимает data/timecode-потоки из MP4, убираем их
         '-map', '-0:d',
         '-map_metadata', '0',
         '-map_chapters', '0',
-        # 10-битный pipeline (p010) снижает бандинг и повышает эффективность
-        '-vf', 'cas=strength=0.3,format=p010le,hwupload',
+        # 10-битный pipeline через VAAPI (полностью на GPU)
+        '-vf', 'scale_vaapi=format=p010le',
         '-c:v', 'av1_vaapi',
         '-rc_mode', 'VBR',
         '-b:v', f'{target_br}k',
@@ -354,10 +428,19 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-c:t', 'copy',
         '-progress', 'pipe:1',
         '-y',
-        str(temp_path)
-    ]
+        '__OUTPUT__'
+    ])
     
-    print(f"\n{Colors.GREEN}▶ Начало конвертации...{Colors.RESET}\n")
+    # Получаем полную команду Docker с маппингом путей
+    cmd, container_input, container_output = docker_runner.build_ffmpeg_cmd(
+        source_path, temp_path, ffmpeg_args
+    )
+    
+    # Заменяем placeholders на контейнерные пути
+    cmd = [container_input if x == '__INPUT__' else x for x in cmd]
+    cmd = [container_output if x == '__OUTPUT__' else x for x in cmd]
+    
+    print(f"\n{Colors.GREEN}▶ Начало конвертации (Docker)...{Colors.RESET}\n")
     
     try:
         current_process = subprocess.Popen(
@@ -578,6 +661,39 @@ def prompt_overwrite_choice(prompt: str, default: str = "n") -> str:
     return mapping.get(answer, default)
 
 
+def check_docker():
+    """Проверка наличия Docker и образа ffmpeg"""
+    # Проверяем Docker
+    if not shutil.which('docker'):
+        print(f"{Colors.RED}Ошибка: Docker не найден. Установите Docker.{Colors.RESET}")
+        sys.exit(1)
+    
+    # Проверяем что Docker daemon запущен
+    result = subprocess.run(['docker', 'info'], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"{Colors.RED}Ошибка: Docker daemon не запущен.{Colors.RESET}")
+        print(f"{Colors.DIM}Запустите: sudo systemctl start docker{Colors.RESET}")
+        sys.exit(1)
+    
+    # Проверяем наличие образа (или тянем)
+    print(f"{Colors.DIM}Проверка Docker образа {DOCKER_IMAGE}...{Colors.RESET}")
+    result = subprocess.run(
+        ['docker', 'image', 'inspect', DOCKER_IMAGE],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"{Colors.YELLOW}Образ не найден, загружаем {DOCKER_IMAGE}...{Colors.RESET}")
+        pull_result = subprocess.run(
+            ['docker', 'pull', DOCKER_IMAGE],
+            capture_output=False
+        )
+        if pull_result.returncode != 0:
+            print(f"{Colors.RED}Ошибка загрузки образа.{Colors.RESET}")
+            sys.exit(1)
+    
+    print(f"{Colors.GREEN}✓ Docker готов{Colors.RESET}")
+
+
 def main():
     """Главная функция"""
     # Устанавливаем обработчики сигналов
@@ -586,10 +702,8 @@ def main():
     
     print_banner()
     
-    # Проверяем наличие ffmpeg
-    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
-        print(f"{Colors.RED}Ошибка: ffmpeg/ffprobe не найден. Установите ffmpeg.{Colors.RESET}")
-        sys.exit(1)
+    # Проверяем Docker вместо локального ffmpeg
+    check_docker()
     
     while True:
         # Запрос пути
@@ -781,4 +895,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
