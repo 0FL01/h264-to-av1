@@ -786,7 +786,7 @@ def main():
                 default_output = generate_output_path(input_path)
                 print(f"\n{Colors.BOLD}Путь для сохранения:{Colors.RESET}")
                 output_str = prompt_input("Выходной файл", str(default_output))
-                output_path = Path(output_str.strip('"\'")).expanduser().resolve()
+                output_path = Path(output_str.strip('"\'' )).expanduser().resolve()
                 output_path = ensure_mkv_output_path(output_path)
                 
                 # Создаём директорию если нужно
@@ -809,7 +809,7 @@ def main():
                 default_output_dir = input_path.parent / f"{input_path.name}-h265"
                 print(f"\n{Colors.BOLD}Папка для сохранения:{Colors.RESET}")
                 output_dir_str = prompt_input("Выходная папка", str(default_output_dir))
-                output_dir = Path(output_dir_str.strip('"\'")).expanduser().resolve()
+                output_dir = Path(output_dir_str.strip('"\'' )).expanduser().resolve()
                 output_dir.mkdir(parents=True, exist_ok=True)
             
             # Подтверждение
