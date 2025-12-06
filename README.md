@@ -1,18 +1,18 @@
-# H264 → AV1 Video Converter (Docker + VAAPI)
+# H264 → AV1 Video Converter (Docker + Vulkan)
 
-Скрипт для автоматического перекодирования H264 (MP4/MKV) в AV1 с аппаратным ускорением VAAPI через Docker-контейнер.
+Скрипт для автоматического перекодирования H264 (MP4/MKV) в AV1 с аппаратным ускорением Vulkan через Docker-контейнер.
 
 | Скрипт | Платформа | Runtime | Кодек | Энкодер |
-|--------|-----------|---------|-------|---------| 
-| `convert_linux.py` | Linux | Docker | AV1 | VAAPI (av1_vaapi) |
+|--------|-----------|---------|-------|---------|
+| `convert_linux.py` | Linux | Docker | AV1 | Vulkan (av1_vulkan) |
 
-> **Тестировано на**: RX 780M + 7840HS, Mesa 25.2.7, Kernel 6.17.9
+> **Тестировано на**: RX 780M + 7840HS, Mesa 25.2.7, Kernel 6.17.9, RADV
 
 ## Ключевые особенности
 
 - **Docker runtime** — ffmpeg на хосте не требуется
+- **Vulkan decode + encode** — полный аппаратный pipeline
 - Автоматический расчёт целевого битрейта (степенная кривая)
-- Аппаратное кодирование AV1 (VAAPI) + 10-битный pipeline (p010)
 - Прогресс-бар, ETA, пакетная обработка папок
 - Атомарные записи, корректная очистка при Ctrl+C
 
@@ -21,21 +21,23 @@
 ## Требования
 
 - **Docker** (с запущенным daemon)
-- Доступ к `/dev/dri/renderD128` (VAAPI render node)
-- Драйвер Mesa/VAAPI для GPU (AMD: `libva-mesa-driver`)
+- Доступ к `/dev/dri` (Vulkan render nodes)
+- Vulkan драйвер:
+  - **AMD**: RADV (Mesa) с переменной `RADV_PERFTEST=video_decode`
+  - **Intel**: ANV с переменной `ANV_VIDEO_DECODE=1`
 - Python 3.12+
 
 > [!TIP]
 > ffmpeg и ffprobe на хосте **не требуются** — всё работает через контейнер `linuxserver/ffmpeg:8.0.1`
 
-### Проверка VAAPI
+### Проверка Vulkan
 
 ```bash
-# Убедитесь что устройство доступно
-ls -la /dev/dri/renderD128
+# Убедитесь что устройства доступны
+ls -la /dev/dri/
 
-# Проверка VAAPI (опционально, если установлен vainfo)
-vainfo
+# Проверка Vulkan (если установлен vulkaninfo)
+vulkaninfo --summary
 ```
 
 ---
@@ -64,9 +66,10 @@ python3 convert_linux.py
          │              └────────────────┬────────────────┘
          │                               │
     ┌────▼────┐                    ┌─────▼─────┐
-    │ Видео   │◀───────────────────│  VAAPI    │
+    │ Видео   │◀───────────────────│  Vulkan   │
     │ файлы   │                    │ /dev/dri  │
     └─────────┘                    └───────────┘
+                                    (RADV/ANV)
 ```
 
 ### Расчёт битрейта

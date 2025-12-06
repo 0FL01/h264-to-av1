@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-H264 to AV1 Converter with VAAPI Hardware Encoding (Docker Runtime)
-Автоматическая конвертация видео с адаптивным битрейтом через Docker контейнер.
+H264 to AV1 Converter with Vulkan Hardware Decode + Encode (Docker Runtime)
+Автоматическая конвертация видео с аппаратным ускорением Vulkan через Docker контейнер.
 """
 
 import os
@@ -20,7 +20,6 @@ from collections import deque
 
 # Docker image для ffmpeg
 DOCKER_IMAGE = "linuxserver/ffmpeg:8.0.1"
-VAAPI_DEVICE = "/dev/dri/renderD128"
 
 # ANSI цвета для красивого вывода
 class Colors:
@@ -112,28 +111,24 @@ def print_banner():
     banner = f"""
 {Colors.CYAN}╔══════════════════════════════════════════════════════════════╗
 ║  {Colors.BOLD}H264 → AV1 Converter{Colors.RESET}{Colors.CYAN}                                        ║
-║  {Colors.DIM}VAAPI Hardware Accelerated (Docker){Colors.RESET}{Colors.CYAN}                        ║
+║  {Colors.DIM}Vulkan Hardware Accelerated (Docker){Colors.RESET}{Colors.CYAN}                        ║
 ╚══════════════════════════════════════════════════════════════╝{Colors.RESET}
 """
     print(banner)
 
 
 class DockerFFmpegRunner:
-    """Обёртка для запуска ffmpeg/ffprobe через Docker"""
+    """Обёртка для запуска ffmpeg/ffprobe через Docker с Vulkan ускорением"""
     
-    def __init__(self, image: str = DOCKER_IMAGE, vaapi_device: str = VAAPI_DEVICE):
+    def __init__(self, image: str = DOCKER_IMAGE):
         self.image = image
-        self.vaapi_device = vaapi_device
-        self.cache_dir = Path.home() / ".cache" / "mesa"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
     
     def _get_docker_base_cmd(self) -> list[str]:
-        """Базовая команда Docker с пробросом устройств"""
+        """Базовая команда Docker с пробросом устройств для Vulkan"""
         return [
             'docker', 'run', '--rm',
-            '--device', self.vaapi_device,
-            '-e', 'XDG_CACHE_HOME=/tmp/cache',
-            '-v', f'{self.cache_dir}:/tmp/cache',
+            '--device=/dev/dri:/dev/dri',  # Vulkan требует полный /dev/dri
+            '-e', 'RADV_PERFTEST=video_decode',  # AMD Vulkan decode
         ]
     
     def _map_path_to_container(self, host_path: Path) -> tuple[str, str]:
@@ -393,13 +388,13 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     conversion_state = ConversionState.IN_PROGRESS
     
     # Формируем аргументы ffmpeg (без самого ffmpeg - он в ENTRYPOINT)
+    # Vulkan decode + Vulkan encode pipeline
     ffmpeg_args = [
         '-hide_banner',
-        '-init_hw_device', f'vaapi=va:{VAAPI_DEVICE}',
-        '-hwaccel', 'vaapi',
-        '-hwaccel_device', VAAPI_DEVICE,
-        '-hwaccel_output_format', 'vaapi',
-        '-filter_hw_device', 'va',
+        '-init_hw_device', 'vulkan=vk:0',
+        '-filter_hw_device', 'vk',
+        '-hwaccel', 'vulkan',
+        '-hwaccel_output_format', 'vulkan',
     ]
     
     # Путь к файлу будет подставлен Docker runner
@@ -412,17 +407,13 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-map', '-0:d',
         '-map_metadata', '0',
         '-map_chapters', '0',
-        # 10-битный pipeline через VAAPI (полностью на GPU)
-        '-vf', 'scale_vaapi=format=p010le',
-        '-c:v', 'av1_vaapi',
-        '-rc_mode', 'VBR',
+        # AV1 Vulkan encoder (полностью на GPU)
+        '-c:v', 'av1_vulkan',
         '-b:v', f'{target_br}k',
         '-maxrate', f'{max_br}k',
         '-bufsize', f'{buf_size}k',
         '-g', str(gop_size),
         '-keyint_min', str(keyint_min),
-        '-bf', '7',
-        '-async_depth', '4',
         '-c:a', 'copy',
         '-c:s', 'copy',
         '-c:t', 'copy',
@@ -440,7 +431,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     cmd = [container_input if x == '__INPUT__' else x for x in cmd]
     cmd = [container_output if x == '__OUTPUT__' else x for x in cmd]
     
-    print(f"\n{Colors.GREEN}▶ Начало конвертации (Docker)...{Colors.RESET}\n")
+    print(f"\n{Colors.GREEN}▶ Начало конвертации (Docker + Vulkan)...{Colors.RESET}\n")
     
     try:
         current_process = subprocess.Popen(
