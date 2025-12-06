@@ -15,6 +15,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
+from collections import deque
 
 # ANSI цвета для красивого вывода
 class Colors:
@@ -200,8 +201,8 @@ def calculate_av1_bitrate(source_info: VideoInfo) -> tuple[int, int, int]:
     """
     source_bitrate = source_info.bitrate
     
-    # Коэффициент сжатия AV1 относительно H264 (AV1 эффективнее на ~40%)
-    efficiency_factor = 0.60  # Сохраняем 60% битрейта для хорошего качества
+    # Коэффициент сжатия AV1 относительно H264 (AV1 эффективнее на ~35%)
+    efficiency_factor = 0.65  # Сохраняем 65% битрейта для чуть более высокого качества
     
     # Базовый расчёт целевого битрейта
     target_bitrate = int(source_bitrate * efficiency_factor)
@@ -285,6 +286,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     Конвертация видео H264 → AV1 с использованием VAAPI.
     """
     global current_temp_file, current_process, conversion_state
+    # Храним хвост stdout/stderr, чтобы не блокировать ffmpeg и показать ошибку при сбое
+    log_tail = deque(maxlen=200)
     
     # Вычисляем параметры кодирования
     target_br, max_br, buf_size = calculate_av1_bitrate(video_info)
@@ -303,6 +306,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-i', str(source_path),
         '-filter_hw_device', 'va',
         '-map', '0', 
+        # Matroska не принимает data/timecode-потоки из MP4, убираем их
+        '-map', '-0:d',
         '-map_metadata', '0',
         '-map_chapters', '0',
         '-vf', 'cas=strength=0.4,format=nv12,hwupload',
@@ -328,7 +333,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         current_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # объединяем stderr, чтобы не заблокироваться на полном буфере
             text=True,
             bufsize=1
         )
@@ -342,6 +347,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
                 break
                 
             line = line.strip()
+            log_tail.append(line)
             if line.startswith('out_time_us='):
                 try:
                     current_us = int(line.split('=')[1])
@@ -365,9 +371,10 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
             return ConversionResult(False, video_info.size_bytes, 0, "Конвертация отменена")
         
         if current_process.returncode != 0:
-            stderr = current_process.stderr.read()
             cleanup_temp_file()
-            return ConversionResult(False, video_info.size_bytes, 0, f"Ошибка ffmpeg: {stderr[:500]}")
+            # Показываем последние строки лога для диагностики
+            error_log = '\n'.join(log_tail)
+            return ConversionResult(False, video_info.size_bytes, 0, f"Ошибка ffmpeg: {error_log[-500:]}")
         
         # Проверяем что файл создан и не пустой
         if not temp_path.exists() or temp_path.stat().st_size == 0:
