@@ -308,7 +308,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-map', '-0:d',
         '-map_metadata', '0',
         '-map_chapters', '0',
-        '-vf', 'cas=strength=0.3,format=nv12,hwupload',
+        # 10-битный pipeline (p010) снижает бандинг и повышает эффективность
+        '-vf', 'cas=strength=0.3,format=p010le,hwupload',
         '-c:v', 'av1_vaapi',
         '-rc_mode', 'VBR',
         '-b:v', f'{target_br}k',
