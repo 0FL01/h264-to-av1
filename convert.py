@@ -302,7 +302,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
         '-i', str(source_path),
         '-filter_hw_device', 'va',
-        '-map', '0',  # маппинг всех потоков: видео, аудио, субтитры и пр.
+        '-map', '0', 
         '-map_metadata', '0',
         '-map_chapters', '0',
         '-vf', 'cas=strength=0.4,format=nv12,hwupload',
@@ -430,18 +430,29 @@ def get_video_files(directory: Path) -> list[Path]:
 
 
 def generate_output_path(input_path: Path, output_dir: Optional[Path] = None) -> Path:
-    """Генерация пути для выходного файла"""
+    """Генерация пути для выходного файла (контейнер MKV)"""
     stem = input_path.stem
     # Убираем существующий суффикс -av1 если есть
     if stem.endswith('-av1'):
         stem = stem[:-4]
     
-    new_name = f"{stem}-av1.mp4"
+    new_name = f"{stem}-av1.mkv"
     
     if output_dir:
         return output_dir / new_name
     else:
         return input_path.parent / new_name
+
+
+def ensure_mkv_output_path(path: Path) -> Path:
+    """
+    Принудительно использовать контейнер MKV, даже если пользователь указал другое расширение.
+    """
+    if path.suffix.lower() != '.mkv':
+        new_path = path.with_suffix('.mkv')
+        print(f"{Colors.DIM}Используем безопасный контейнер MKV: {path.name} → {new_path.name}{Colors.RESET}")
+        return new_path
+    return path
 
 
 def prompt_input(prompt: str, default: str = "") -> str:
@@ -519,6 +530,7 @@ def main():
             print(f"\n{Colors.BOLD}Путь для сохранения:{Colors.RESET}")
             output_str = prompt_input("Выходной файл", str(default_output))
             output_path = Path(output_str).expanduser().resolve()
+            output_path = ensure_mkv_output_path(output_path)
             
             # Создаём директорию если нужно
             output_path.parent.mkdir(parents=True, exist_ok=True)
