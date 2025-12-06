@@ -236,6 +236,20 @@ def calculate_av1_bitrate(source_info: VideoInfo) -> tuple[int, int, int]:
     return target_bitrate, max_rate, buf_size
 
 
+def calculate_gop_params(source_info: VideoInfo) -> tuple[int, int]:
+    """
+    Адаптивный GOP: ~10 секунд (FPS * 10) и минимальный интервал ключевых кадров ~1 секунда.
+    Возвращает: (gop_size, keyint_min).
+    """
+    fallback_fps = 24.0
+    fps = source_info.fps if source_info.fps > 0 else fallback_fps
+    
+    gop_size = max(1, int(round(fps * 10)))  # 10 секунд для удобной перемотки без потери эффективности
+    keyint_min = max(1, int(round(fps)))     # минимум один ключевой кадр в секунду
+    
+    return gop_size, keyint_min
+
+
 def format_size(size_bytes: int) -> str:
     """Форматирование размера файла"""
     for unit in ['Б', 'КБ', 'МБ', 'ГБ']:
@@ -271,12 +285,14 @@ def print_video_info(info: VideoInfo):
     print(f"   Размер: {format_size(info.size_bytes)}")
 
 
-def print_conversion_params(target_br: int, max_br: int, buf_size: int):
+def print_conversion_params(target_br: int, max_br: int, buf_size: int, gop_size: int, keyint_min: int):
     """Вывод параметров конвертации"""
     print(f"\n{Colors.CYAN}⚙ Параметры AV1 кодирования:{Colors.RESET}")
     print(f"   Целевой битрейт: {target_br} kbps")
     print(f"   Максимальный: {max_br} kbps")
     print(f"   Буфер: {buf_size} kbps")
+    print(f"   GOP: {gop_size} кадров (≈10 сек)")
+    print(f"   keyint_min: {keyint_min} кадров (≈1 сек)")
 
 
 def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -> ConversionResult:
@@ -289,7 +305,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     
     # Вычисляем параметры кодирования
     target_br, max_br, buf_size = calculate_av1_bitrate(video_info)
-    print_conversion_params(target_br, max_br, buf_size)
+    gop_size, keyint_min = calculate_gop_params(video_info)
+    print_conversion_params(target_br, max_br, buf_size, gop_size, keyint_min)
     
     # Создаём временный файл (атомарность)
     temp_path = output_path.with_suffix('.tmp' + output_path.suffix)
@@ -315,7 +332,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-b:v', f'{target_br}k',
         '-maxrate', f'{max_br}k',
         '-bufsize', f'{buf_size}k',
-        '-g', '240',
+        '-g', str(gop_size),
+        '-keyint_min', str(keyint_min),
         '-bf', '7',
         '-async_depth', '4',
         '-c:a', 'copy',
@@ -487,6 +505,43 @@ def prompt_yes_no(prompt: str, default: bool = True) -> bool:
         return default
 
 
+def prompt_overwrite_choice(prompt: str, default: str = "n") -> str:
+    """
+    Подтверждение перезаписи с ускоренными вариантами (RU/EN):
+    'y/д' — перезаписать, 'n/н' — пропустить,
+    'all/a/в' — перезаписывать все, 'skip_all/s/п' — пропускать все.
+    Возвращает одно из: 'y', 'n', 'all', 'skip_all'.
+    """
+    default = default.lower()
+    if default not in {"y", "n", "all", "skip_all"}:
+        default = "n"
+    
+    default_hint = {
+        "y": "Д/н/в/п | Y/n/a/s",
+        "n": "д/Н/в/п | y/N/a/s",
+        "all": "д/н/В/п | y/n/A/s",
+        "skip_all": "д/н/в/П | y/n/a/S"
+    }[default]
+    
+    mapping = {
+        'y': 'y', 'д': 'y', 'd': 'y', 'yes': 'y',
+        'n': 'n', 'н': 'n', 'no': 'n',
+        'a': 'all', 'в': 'all', 'all': 'all',
+        's': 'skip_all', 'п': 'skip_all', 'skip': 'skip_all',
+        'sa': 'skip_all', 'skip_all': 'skip_all', 'skipall': 'skip_all'
+    }
+    
+    try:
+        answer = input(f"{prompt} [{default_hint}]: ").strip().lower()
+    except EOFError:
+        return default
+    
+    if not answer:
+        return default
+    
+    return mapping.get(answer, default)
+
+
 def main():
     """Главная функция"""
     # Устанавливаем обработчики сигналов
@@ -572,6 +627,7 @@ def main():
         failed = 0
         total_saved = 0
         skipped_files: list[tuple[Path, str]] = []  # (путь, кодек) — файлы h265/av1
+        overwrite_mode = "ask"  # ask | all_yes | all_no
         
         for idx, file_path in enumerate(files_to_process, 1):
             print(f"\n{Colors.HEADER}{'═' * 60}{Colors.RESET}")
@@ -604,9 +660,29 @@ def main():
             
             # Проверяем, не существует ли уже выходной файл
             if out_path.exists():
-                if not prompt_yes_no(f"{Colors.YELLOW}Файл {out_path.name} существует. Перезаписать?{Colors.RESET}", False):
-                    print(f"{Colors.DIM}Пропуск{Colors.RESET}")
+                if overwrite_mode == "all_no":
+                    print(f"{Colors.DIM}Пропуск: {out_path.name} (выбрано 'пропускать все / skip all'){Colors.RESET}")
                     continue
+                elif overwrite_mode == "all_yes":
+                    pass
+                else:
+                    print(f"{Colors.YELLOW}Файл уже существует:{Colors.RESET} {out_path}")
+                    print(f"{Colors.DIM}Варианты: д/y — перезаписать; н/n — пропустить; в/a — перезаписывать все; п/s — пропускать все.{Colors.RESET}")
+                    choice = prompt_overwrite_choice(
+                        f"{Colors.YELLOW}Перезаписать файл {out_path.name}?{Colors.RESET}",
+                        default="n"
+                    )
+                    if choice == "all":
+                        overwrite_mode = "all_yes"
+                        print(f"{Colors.DIM}Выбрано: перезаписывать все последующие (all){Colors.RESET}")
+                    elif choice == "skip_all":
+                        overwrite_mode = "all_no"
+                        print(f"{Colors.DIM}Выбрано: пропускать все последующие (skip all){Colors.RESET}")
+                    
+                    if choice in {"n", "skip_all"}:
+                        reason = "пропуск этого файла" if choice == "n" else "пропуск всех последующих"
+                        print(f"{Colors.DIM}Пропуск: {out_path.name} ({reason}){Colors.RESET}")
+                        continue
             
             # Конвертируем
             result = convert_video(file_path, out_path, video_info)
