@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import json
 import re
+import math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -194,18 +195,15 @@ def get_video_info(file_path: Path) -> Optional[VideoInfo]:
 
 def calculate_av1_bitrate(source_info: VideoInfo) -> tuple[int, int, int]:
     """
-    Расчёт оптимального битрейта для AV1.
-    AV1 обычно эффективнее H264 на 30-50%.
-    
-    Возвращает: (target_bitrate, max_rate, buf_size) в kbps
+    Расчёт оптимального битрейта для AV1 с нелинейной кривой.
+    Возвращает: (target_bitrate, max_rate, buf_size) в kbps.
     """
-    source_bitrate = source_info.bitrate
-    
-    # Коэффициент сжатия AV1 относительно H264 (AV1 эффективнее на ~35%)
-    efficiency_factor = 0.65  # Сохраняем 65% битрейта для чуть более высокого качества
-    
-    # Базовый расчёт целевого битрейта
-    target_bitrate = int(source_bitrate * efficiency_factor)
+    # Нелинейная (логарифмическая) кривая сжатия:
+    # при высоких битрейтах агрессивнее урезаем, при низких — бережнее.
+    source_bitrate = max(source_info.bitrate, 1)
+    alpha = 0.72    # крутизна кривой: <1 сжимает сильнее на верхах, мягче на низах
+    scale = 6.0     # коэффициент масштаба (подгонка под целевые уровни качества)
+    target_bitrate = int(scale * (math.pow(source_bitrate, alpha)))
     
     # Минимальные пороги качества в зависимости от разрешения
     resolution = source_info.width * source_info.height
@@ -310,7 +308,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-map', '-0:d',
         '-map_metadata', '0',
         '-map_chapters', '0',
-        '-vf', 'cas=strength=0.4,format=nv12,hwupload',
+        '-vf', 'cas=strength=0.3,format=nv12,hwupload',
         '-c:v', 'av1_vaapi',
         '-rc_mode', 'VBR',
         '-b:v', f'{target_br}k',
