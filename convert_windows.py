@@ -43,6 +43,7 @@ class HWEncoder(Enum):
     NVENC = "hevc_nvenc"      # NVIDIA
     QSV = "hevc_qsv"          # Intel QuickSync
     AMF = "hevc_amf"          # AMD AMF
+    D3D12VA = "hevc_d3d12va"  # D3D12 Video Acceleration (Windows 10+)
     SOFTWARE = "libx265"       # CPU fallback
 
 
@@ -165,18 +166,23 @@ def detect_available_encoders() -> list[HWEncoder]:
     encoders_output = result.stdout
     
     # Проверяем каждый энкодер
+    # Порядок важен: от наиболее предпочтительного к менее
     encoder_checks = [
         (HWEncoder.NVENC, 'hevc_nvenc', 'NVIDIA NVENC'),
-        (HWEncoder.QSV, 'hevc_qsv', 'Intel QuickSync'),
         (HWEncoder.AMF, 'hevc_amf', 'AMD AMF'),
+        (HWEncoder.QSV, 'hevc_qsv', 'Intel QuickSync'),
+        (HWEncoder.D3D12VA, 'hevc_d3d12va', 'D3D12 Video Acceleration'),
     ]
     
     for encoder, codec_name, display_name in encoder_checks:
         if codec_name in encoders_output:
             # Дополнительная проверка — пробуем инициализировать энкодер
+            # Используем color filter вместо nullsrc — HW энкодеры требуют реальные пиксели
             test_cmd = [
-                'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
-                '-c:v', codec_name, '-f', 'null', '-'
+                'ffmpeg', '-hide_banner', '-y',
+                '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=0.1:r=30',
+                '-c:v', codec_name, '-frames:v', '1',
+                '-f', 'null', '-'
             ]
             test_result = run_command(test_cmd)
             if test_result.returncode == 0:
@@ -211,6 +217,7 @@ def select_encoder(available: list[HWEncoder]) -> HWEncoder:
         HWEncoder.NVENC: "NVIDIA NVENC (быстрый, хорошее качество)",
         HWEncoder.QSV: "Intel QuickSync (быстрый, среднее качество)",
         HWEncoder.AMF: "AMD AMF (быстрый, хорошее качество)",
+        HWEncoder.D3D12VA: "D3D12VA (Windows 10+, универсальный)",
         HWEncoder.SOFTWARE: "Software libx265 (медленный, лучшее качество)"
     }
     
@@ -394,6 +401,7 @@ def print_conversion_params(target_br: int, max_br: int, buf_size: int, gop_size
         HWEncoder.NVENC: "NVIDIA NVENC",
         HWEncoder.QSV: "Intel QuickSync",
         HWEncoder.AMF: "AMD AMF",
+        HWEncoder.D3D12VA: "D3D12 Video Acceleration",
         HWEncoder.SOFTWARE: "Software (libx265)"
     }
     
@@ -456,6 +464,17 @@ def build_encoder_params(encoder: HWEncoder, target_br: int, max_br: int, buf_si
             '-bf', '4',
             '-preanalysis', 'true',
             '-vbaq', 'true',
+        ]
+    
+    elif encoder == HWEncoder.D3D12VA:
+        # D3D12 Video Acceleration параметры (Windows 10+)
+        # Использует встроенный GPU через DirectX 12
+        return [
+            '-c:v', 'hevc_d3d12va',
+            '-b:v', f'{target_br}k',
+            '-maxrate', f'{max_br}k',
+            '-bufsize', f'{buf_size}k',
+            '-g', str(gop_size),
         ]
     
     else:  # SOFTWARE (libx265)
