@@ -61,7 +61,7 @@ python3 convert_linux.py
 
 ```
 ┌─────────────────┐     ┌─────────────────────────────────┐
-│ convert_linux.py│────▶│ Docker: linuxserver/ffmpeg:8.0.1│
+│ convert_linux.py│───▶│ Docker: linuxserver/ffmpeg:8.0.1│
 │   (Python)      │     │   ├─ ffprobe (info)             │
 └────────┬────────┘     │   └─ ffmpeg (encode)            │
          │              └────────────────┬────────────────┘
