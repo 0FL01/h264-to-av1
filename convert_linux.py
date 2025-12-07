@@ -158,7 +158,14 @@ class DockerFFmpegRunner:
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',  # ffprobe может вернуть байты вне UTF-8
+                check=False
+            )
             return result
         except FileNotFoundError:
             print(f"{Colors.RED}Ошибка: Docker не найден. Установите Docker.{Colors.RESET}")
@@ -389,6 +396,15 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     current_temp_file = temp_path
     conversion_state = ConversionState.IN_PROGRESS
     
+    # Определяем кодек субтитров в зависимости от входного контейнера:
+    # - MP4/M4V/MOV используют mov_text (tx3g), который НЕ поддерживается MKV
+    # - MKV уже содержит совместимые форматы (srt, ass, pgs)
+    source_ext = source_path.suffix.lower()
+    if source_ext in ['.mp4', '.m4v', '.mov']:
+        subtitle_codec = 'srt'  # конвертируем mov_text → srt
+    else:
+        subtitle_codec = 'copy'  # MKV субтитры копируем как есть
+    
     # Формируем аргументы ffmpeg (без самого ffmpeg - он в ENTRYPOINT)
     # Vulkan decode + Vulkan encode pipeline
     ffmpeg_args = [
@@ -404,9 +420,16 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     ffmpeg_args.extend(['-i', '__INPUT__'])
     
     ffmpeg_args.extend([
-        '-map', '0',
-        # Matroska не принимает data/timecode-потоки из MP4, убираем их
-        '-map', '-0:d',
+        # Явно маппим только нужные типы потоков.
+        # M4V/MOV файлы могут содержать tmcd, chapters и другие data потоки,
+        # которые несовместимы с MKV или Vulkan pipeline.
+        # Суффикс '?' означает "если есть" — не падать если потока нет.
+        # ВАЖНО: 0:V (большая V) — только "настоящее" видео, БЕЗ attached pics,
+        # thumbnails, cover art. Эти mjpeg картинки нельзя кодировать через Vulkan.
+        '-map', '0:V',
+        '-map', '0:a?',
+        '-map', '0:s?',
+        '-map', '0:t?',  # attachments (шрифты) для MKV
         '-map_metadata', '0',
         '-map_chapters', '0',
         # AV1 Vulkan encoder (полностью на GPU)
@@ -417,7 +440,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
         '-g', str(gop_size),
         '-keyint_min', str(keyint_min),
         '-c:a', 'copy',
-        '-c:s', 'copy',
+        '-c:s', subtitle_codec,
         '-c:t', 'copy',
         '-progress', 'pipe:1',
         '-y',
@@ -441,6 +464,8 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # объединяем stderr, чтобы не заблокироваться на полном буфере
             text=True,
+            encoding='utf-8',
+            errors='replace',  # защищаемся от нечитаемых байт в выводе ffmpeg
             bufsize=1
         )
         
@@ -503,7 +528,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
             cleanup_temp_file()
             # Показываем последние строки лога для диагностики
             error_log = '\n'.join(log_tail)
-            return ConversionResult(False, video_info.size_bytes, 0, f"Ошибка ffmpeg: {error_log[-500:]}")
+            return ConversionResult(False, video_info.size_bytes, 0, f"Ошибка ffmpeg: {error_log[-4000:]}")
         
         # Проверяем что файл создан и не пустой
         if not temp_path.exists() or temp_path.stat().st_size == 0:
@@ -552,8 +577,8 @@ def print_result(result: ConversionResult, output_path: Path):
 
 
 def is_video_file(path: Path) -> bool:
-    """Проверка, является ли файл видео (mp4/mkv)"""
-    return path.suffix.lower() in ['.mp4', '.mkv']
+    """Проверка, является ли файл видео (mp4/mkv/m4v/mov)"""
+    return path.suffix.lower() in ['.mp4', '.mkv', '.m4v', '.mov']
 
 
 def get_video_files(directory: Path) -> list[Path]:
@@ -725,7 +750,7 @@ def main():
         
         if input_path.is_file():
             if not is_video_file(input_path):
-                print(f"{Colors.RED}Файл не является видео (mp4/mkv): {input_path}{Colors.RESET}")
+                print(f"{Colors.RED}Файл не является видео (mp4/mkv/m4v/mov): {input_path}{Colors.RESET}")
                 continue
             files_to_process = [input_path]
             
@@ -743,7 +768,7 @@ def main():
             files_to_process = get_video_files(input_path)
             
             if not files_to_process:
-                print(f"{Colors.YELLOW}В папке нет видеофайлов (mp4/mkv){Colors.RESET}")
+                print(f"{Colors.YELLOW}В папке нет видеофайлов (mp4/mkv/m4v/mov){Colors.RESET}")
                 continue
             
             print(f"\n{Colors.BLUE}Найдено видеофайлов: {len(files_to_process)}{Colors.RESET}")
