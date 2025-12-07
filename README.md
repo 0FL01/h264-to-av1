@@ -13,6 +13,7 @@
 - **Docker runtime** — ffmpeg на хосте не требуется
 - **Vulkan decode + encode** — полный аппаратный pipeline
 - Автоматический расчёт целевого битрейта (степенная кривая)
+- Smart Skip: пропуск, если выигрыш по битрейту < ~5%
 - Прогресс-бар, ETA, пакетная обработка папок
 - Атомарные записи, корректная очистка при Ctrl+C
 
@@ -82,7 +83,9 @@ python3 convert_linux.py
    - 1080p: 2 000–8 000 kbps
    - 720p: 1 000–5 000 kbps
    - SD: 500–3 000 kbps
-4. `maxrate = target × 1.6`, `bufsize = target × 2`
+4. Целевой битрейт не выше исходного (`min(target, source_bitrate)`)
+5. `maxrate = target × 1.6`, `bufsize = target × 2`
+6. Если `target >= source_bitrate × 0.95`, конвертация пропускается как нецелесообразная
 
 ---
 

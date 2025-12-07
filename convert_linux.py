@@ -20,6 +20,7 @@ from collections import deque
 
 # Docker image для ffmpeg
 DOCKER_IMAGE = "linuxserver/ffmpeg:8.0.1"
+WORTHINESS_THRESHOLD = 0.95
 
 # ANSI цвета для красивого вывода
 class Colors:
@@ -287,6 +288,7 @@ def calculate_av1_bitrate(source_info: VideoInfo) -> tuple[int, int, int]:
     
     # Применяем ограничения
     target_bitrate = max(min_bitrate, min(target_bitrate, max_reasonable))
+    target_bitrate = min(target_bitrate, source_info.bitrate)
     
     # Максимальный битрейт для VBR (пиковые моменты)
     max_rate = int(target_bitrate * 1.6)
@@ -767,7 +769,7 @@ def main():
         successful = 0
         failed = 0
         total_saved = 0
-        skipped_files: list[tuple[Path, str]] = []  # (путь, кодек) — файлы h265/av1
+        skipped_files: list[tuple[Path, str]] = []
         overwrite_mode = "ask"  # ask | all_yes | all_no
         
         for idx, file_path in enumerate(files_to_process, 1):
@@ -792,6 +794,14 @@ def main():
                 continue
             
             print_video_info(video_info)
+            target_br, _, _ = calculate_av1_bitrate(video_info)
+            if target_br >= int(video_info.bitrate * WORTHINESS_THRESHOLD):
+                print(
+                    f"\n{Colors.YELLOW}⏭ Пропуск: целевой битрейт {target_br} kbps "
+                    f"близок к исходному {video_info.bitrate} kbps.{Colors.RESET}"
+                )
+                skipped_files.append((file_path, "Нецелесообразно"))
+                continue
             
             # Определяем выходной путь
             if output_dir:
@@ -845,19 +855,19 @@ def main():
             if failed > 0:
                 print(f"   {Colors.RED}✗ Ошибок: {failed}{Colors.RESET}")
             if skipped_files:
-                print(f"   {Colors.YELLOW}⏭ Пропущено (h265/av1): {len(skipped_files)}{Colors.RESET}")
+                print(f"   {Colors.YELLOW}⏭ Пропущено: {len(skipped_files)}{Colors.RESET}")
             
             if total_saved >= 0:
                 print(f"\n   {Colors.GREEN}💾 Всего сэкономлено: {format_size(total_saved)}{Colors.RESET}")
             else:
                 print(f"\n   {Colors.YELLOW}⚠ Общее увеличение: {format_size(abs(total_saved))}{Colors.RESET}")
         
-        # Предложение скопировать пропущенные файлы h265/av1
+        # Предложение скопировать пропущенные файлы
         if skipped_files and successful > 0 and output_dir:
             print(f"\n{Colors.CYAN}{'─' * 60}{Colors.RESET}")
-            print(f"{Colors.BOLD}📁 Обнаружены файлы H265/AV1, которые не требуют конвертации:{Colors.RESET}")
-            for skip_path, skip_codec in skipped_files[:5]:
-                print(f"   • {skip_path.name} ({skip_codec})")
+            print(f"{Colors.BOLD}📁 Обнаружены пропущенные файлы:{Colors.RESET}")
+            for skip_path, skip_reason in skipped_files[:5]:
+                print(f"   • {skip_path.name} ({skip_reason})")
             if len(skipped_files) > 5:
                 print(f"   ... и ещё {len(skipped_files) - 5}")
             
