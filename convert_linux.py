@@ -74,6 +74,23 @@ class ConversionState(Enum):
     FAILED = "failed"
 
 
+@dataclass
+class FileToConvert:
+    """Файл для конвертации с метаданными"""
+    path: Path
+    video_info: VideoInfo
+    output_path: Path
+    target_bitrate: int
+
+
+@dataclass
+class SkippedFile:
+    """Пропущенный файл с причиной"""
+    path: Path
+    reason: str
+    size_bytes: int = 0
+
+
 # Глобальные переменные для обработки прерываний
 current_temp_file: Optional[Path] = None
 current_process: Optional[subprocess.Popen] = None
@@ -627,12 +644,262 @@ def is_video_file(path: Path) -> bool:
 
 
 def get_video_files(directory: Path) -> list[Path]:
-    """Получение списка видеофайлов в директории"""
+    """Получение списка видеофайлов в директории (без рекурсии)"""
     files = []
     for f in directory.iterdir():
         if f.is_file() and is_video_file(f):
             files.append(f)
     return sorted(files)
+
+
+def get_video_files_recursive(directory: Path) -> list[Path]:
+    """Рекурсивный поиск видеофайлов во всех подпапках"""
+    files = []
+    for f in directory.rglob('*'):
+        if f.is_file() and is_video_file(f):
+            files.append(f)
+    return sorted(files)
+
+
+def analyze_files_for_conversion(
+    files: list[Path],
+    root_dir: Path
+) -> tuple[list[FileToConvert], list[SkippedFile]]:
+    """
+    Анализ файлов для Auto режима.
+    Возвращает: (список файлов для конвертации, список пропущенных файлов)
+    """
+    to_convert: list[FileToConvert] = []
+    to_skip: list[SkippedFile] = []
+    
+    # Кодеки, которые не нужно конвертировать
+    skip_codecs = {'av1', 'hevc', 'h265'}
+    
+    print(f"\n{Colors.DIM}Анализ {len(files)} файлов...{Colors.RESET}")
+    
+    for idx, file_path in enumerate(files, 1):
+        # Прогресс анализа
+        if idx % 10 == 0 or idx == len(files):
+            print(f"\r{Colors.DIM}  Проанализировано: {idx}/{len(files)}{Colors.RESET}", end='', flush=True)
+        
+        # Пропускаем файлы, которые уже являются результатом конвертации (-av1.mkv)
+        if file_path.stem.endswith('-av1') and file_path.suffix.lower() == '.mkv':
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason="уже конвертирован (-av1.mkv)",
+                size_bytes=file_path.stat().st_size if file_path.exists() else 0
+            ))
+            continue
+        
+        # Проверяем, существует ли уже конвертированная версия рядом
+        output_path = generate_output_path(file_path, output_dir=None)
+        if output_path.exists():
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason=f"уже есть {output_path.name}",
+                size_bytes=file_path.stat().st_size if file_path.exists() else 0
+            ))
+            continue
+        
+        # Получаем информацию о видео
+        video_info = get_video_info(file_path)
+        if not video_info:
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason="не удалось прочитать",
+                size_bytes=file_path.stat().st_size if file_path.exists() else 0
+            ))
+            continue
+        
+        # Пропускаем уже эффективные кодеки
+        if video_info.codec.lower() in skip_codecs:
+            codec_name = 'AV1' if video_info.codec.lower() == 'av1' else 'HEVC'
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason=f"уже {codec_name}",
+                size_bytes=video_info.size_bytes
+            ))
+            continue
+        
+        # Проверяем целесообразность конвертации
+        target_br, _, _ = calculate_av1_bitrate(video_info)
+        if target_br >= int(video_info.bitrate * WORTHINESS_THRESHOLD):
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason="нецелесообразно (низкий битрейт)",
+                size_bytes=video_info.size_bytes
+            ))
+            continue
+        
+        # Файл подходит для конвертации
+        to_convert.append(FileToConvert(
+            path=file_path,
+            video_info=video_info,
+            output_path=output_path,
+            target_bitrate=target_br
+        ))
+    
+    print()  # Новая строка после прогресса
+    return to_convert, to_skip
+
+
+def print_conversion_plan(
+    to_convert: list[FileToConvert],
+    to_skip: list[SkippedFile],
+    root_dir: Path
+) -> None:
+    """Вывод наглядного плана конвертации для Auto режима"""
+    
+    print(f"\n{Colors.CYAN}╔════════════════════════════════════════════════════════════╗{Colors.RESET}")
+    print(f"{Colors.CYAN}║  {Colors.BOLD}ПЛАН КОНВЕРТАЦИИ (Auto режим){Colors.RESET}{Colors.CYAN}                             ║{Colors.RESET}")
+    print(f"{Colors.CYAN}╚════════════════════════════════════════════════════════════╝{Colors.RESET}")
+    
+    print(f"\n📁 Корневая папка: {Colors.BOLD}{root_dir}{Colors.RESET}")
+    
+    # Файлы для конвертации
+    if to_convert:
+        total_size = sum(f.video_info.size_bytes for f in to_convert)
+        print(f"\n{Colors.GREEN}┌─ БУДУТ КОНВЕРТИРОВАНЫ ({len(to_convert)} файлов, ~{format_size(total_size)}):{Colors.RESET}")
+        
+        # Показываем первые 10 файлов
+        display_count = min(10, len(to_convert))
+        for i, f in enumerate(to_convert[:display_count]):
+            # Относительный путь от корня
+            try:
+                rel_path = f.path.relative_to(root_dir)
+            except ValueError:
+                rel_path = f.path.name
+            
+            prefix = "└─" if i == display_count - 1 and len(to_convert) <= 10 else "├─"
+            size_str = format_size(f.video_info.size_bytes)
+            print(f"{Colors.GREEN}│  {prefix} {rel_path} ({size_str}) → {f.output_path.name}{Colors.RESET}")
+        
+        if len(to_convert) > 10:
+            print(f"{Colors.GREEN}│  └─ ... и ещё {len(to_convert) - 10} файлов{Colors.RESET}")
+    else:
+        print(f"\n{Colors.YELLOW}┌─ НЕТ ФАЙЛОВ ДЛЯ КОНВЕРТАЦИИ{Colors.RESET}")
+    
+    # Пропущенные файлы
+    if to_skip:
+        total_skip_size = sum(f.size_bytes for f in to_skip)
+        print(f"\n{Colors.YELLOW}┌─ БУДУТ ПРОПУЩЕНЫ ({len(to_skip)} файлов, ~{format_size(total_skip_size)}):{Colors.RESET}")
+        
+        # Группируем по причинам
+        by_reason: dict[str, list[SkippedFile]] = {}
+        for f in to_skip:
+            by_reason.setdefault(f.reason, []).append(f)
+        
+        for reason, files in by_reason.items():
+            print(f"{Colors.YELLOW}│  ├─ {reason}: {len(files)} файлов{Colors.RESET}")
+    
+    # Предупреждение об удалении
+    if to_convert:
+        print(f"\n{Colors.RED}{Colors.BOLD}⚠ ПОСЛЕ УСПЕШНОЙ КОНВЕРТАЦИИ ИСХОДНИКИ БУДУТ УДАЛЕНЫ!{Colors.RESET}")
+
+
+def run_auto_mode() -> None:
+    """Основной цикл Auto режима с рекурсивной конвертацией и удалением исходников"""
+    
+    while True:
+        # Запрос папки
+        print(f"\n{Colors.BOLD}Введите путь к папке для рекурсивной конвертации:{Colors.RESET}")
+        print(f"{Colors.DIM}(или 'q' для возврата в меню){Colors.RESET}")
+        
+        input_path_str = prompt_input("Путь")
+        
+        if input_path_str.lower() in ['q', 'quit', 'exit', 'в', 'выход', 'назад']:
+            return
+        
+        if not input_path_str:
+            print(f"{Colors.YELLOW}Путь не указан{Colors.RESET}")
+            continue
+        
+        input_path = Path(input_path_str).expanduser().resolve()
+        
+        if not input_path.exists():
+            print(f"{Colors.RED}Путь не существует: {input_path}{Colors.RESET}")
+            continue
+        
+        if not input_path.is_dir():
+            print(f"{Colors.RED}Путь должен быть папкой: {input_path}{Colors.RESET}")
+            continue
+        
+        # Рекурсивный поиск видеофайлов
+        print(f"\n{Colors.CYAN}🔍 Поиск видеофайлов...{Colors.RESET}")
+        all_files = get_video_files_recursive(input_path)
+        
+        if not all_files:
+            print(f"{Colors.YELLOW}Видеофайлы не найдены в папке и подпапках{Colors.RESET}")
+            continue
+        
+        print(f"{Colors.GREEN}Найдено видеофайлов: {len(all_files)}{Colors.RESET}")
+        
+        # Анализ файлов
+        to_convert, to_skip = analyze_files_for_conversion(all_files, input_path)
+        
+        # Вывод плана
+        print_conversion_plan(to_convert, to_skip, input_path)
+        
+        if not to_convert:
+            print(f"\n{Colors.YELLOW}Нет файлов для конвертации.{Colors.RESET}")
+            continue
+        
+        # Подтверждение
+        if not prompt_yes_no(f"\n{Colors.YELLOW}Начать конвертацию?{Colors.RESET}"):
+            print(f"{Colors.DIM}Отменено{Colors.RESET}")
+            continue
+        
+        # Обработка файлов
+        total_files = len(to_convert)
+        successful = 0
+        failed = 0
+        deleted = 0
+        total_saved = 0
+        
+        for idx, file_info in enumerate(to_convert, 1):
+            print(f"\n{Colors.HEADER}{'═' * 60}{Colors.RESET}")
+            print(f"{Colors.HEADER}[{idx}/{total_files}] Обработка: {file_info.path.name}{Colors.RESET}")
+            print(f"{Colors.HEADER}{'═' * 60}{Colors.RESET}")
+            
+            print_video_info(file_info.video_info)
+            
+            # Конвертируем
+            result = convert_video(file_info.path, file_info.output_path, file_info.video_info)
+            print_result(result, file_info.output_path)
+            
+            if result.success:
+                successful += 1
+                total_saved += (result.source_size - result.output_size)
+                
+                # Удаляем исходник
+                try:
+                    file_info.path.unlink()
+                    deleted += 1
+                    print(f"{Colors.GREEN}🗑 Исходник удалён: {file_info.path.name}{Colors.RESET}")
+                except OSError as e:
+                    print(f"{Colors.RED}⚠ Не удалось удалить исходник: {e}{Colors.RESET}")
+            else:
+                failed += 1
+        
+        # Итоговая статистика
+        print(f"\n{Colors.CYAN}{'═' * 60}{Colors.RESET}")
+        print(f"{Colors.CYAN}📊 ИТОГОВАЯ СТАТИСТИКА (Auto режим){Colors.RESET}")
+        print(f"{Colors.CYAN}{'═' * 60}{Colors.RESET}")
+        print(f"   Всего в плане: {total_files}")
+        print(f"   {Colors.GREEN}✓ Успешно конвертировано: {successful}{Colors.RESET}")
+        if deleted > 0:
+            print(f"   {Colors.GREEN}🗑 Исходников удалено: {deleted}{Colors.RESET}")
+        if failed > 0:
+            print(f"   {Colors.RED}✗ Ошибок: {failed}{Colors.RESET}")
+        if to_skip:
+            print(f"   {Colors.YELLOW}⏭ Пропущено: {len(to_skip)}{Colors.RESET}")
+        
+        if total_saved >= 0:
+            print(f"\n   {Colors.GREEN}💾 Всего сэкономлено: {format_size(total_saved)}{Colors.RESET}")
+        else:
+            print(f"\n   {Colors.YELLOW}⚠ Общее увеличение: {format_size(abs(total_saved))}{Colors.RESET}")
+        
+        print()
 
 
 def generate_output_path(input_path: Path, output_dir: Optional[Path] = None) -> Path:
@@ -724,6 +991,29 @@ def prompt_overwrite_choice(prompt: str, default: str = "n") -> str:
     return mapping.get(answer, default)
 
 
+def prompt_mode_choice() -> str:
+    """
+    Выбор режима работы: Auto или Manual.
+    Возвращает 'auto' или 'manual'.
+    """
+    print(f"\n{Colors.BOLD}Выберите режим работы:{Colors.RESET}")
+    print(f"  {Colors.CYAN}1{Colors.RESET}. {Colors.BOLD}Auto{Colors.RESET}   — рекурсивная конвертация папки с удалением исходников")
+    print(f"  {Colors.CYAN}2{Colors.RESET}. {Colors.BOLD}Manual{Colors.RESET} — ручной выбор файлов/папки (без удаления)")
+    
+    while True:
+        try:
+            answer = input(f"\nВыберите [{Colors.DIM}1/2{Colors.RESET}]: ").strip().lower()
+        except EOFError:
+            return "manual"
+        
+        if answer in ['1', 'auto', 'a', 'а', 'авто']:
+            return "auto"
+        elif answer in ['2', 'manual', 'm', 'м', 'ручной', '']:
+            return "manual"
+        else:
+            print(f"{Colors.YELLOW}Введите 1 (Auto) или 2 (Manual){Colors.RESET}")
+
+
 def check_docker():
     """Проверка наличия Docker и образа ffmpeg"""
     # Проверяем Docker
@@ -757,27 +1047,18 @@ def check_docker():
     print(f"{Colors.GREEN}✓ Docker готов{Colors.RESET}")
 
 
-def main():
-    """Главная функция"""
-    # Устанавливаем обработчики сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    print_banner()
-    
-    # Проверяем Docker вместо локального ffmpeg
-    check_docker()
+def run_manual_mode() -> None:
+    """Ручной режим: выбор файлов/папки без удаления исходников"""
     
     while True:
         # Запрос пути
         print(f"\n{Colors.BOLD}Введите путь к файлу или папке с видео:{Colors.RESET}")
-        print(f"{Colors.DIM}(или 'q' для выхода){Colors.RESET}")
+        print(f"{Colors.DIM}(или 'q' для возврата в меню){Colors.RESET}")
         
         input_path_str = prompt_input("Путь")
         
-        if input_path_str.lower() in ['q', 'quit', 'exit', 'в', 'выход']:
-            print(f"\n{Colors.CYAN}До свидания!{Colors.RESET}")
-            break
+        if input_path_str.lower() in ['q', 'quit', 'exit', 'в', 'выход', 'назад']:
+            return
         
         if not input_path_str:
             print(f"{Colors.YELLOW}Путь не указан{Colors.RESET}")
@@ -962,6 +1243,33 @@ def main():
                 print(f"{Colors.DIM}Копирование отклонено{Colors.RESET}")
         
         print()
+
+
+def main():
+    """Главная функция"""
+    # Устанавливаем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print_banner()
+    
+    # Проверяем Docker вместо локального ffmpeg
+    check_docker()
+    
+    while True:
+        # Выбор режима работы
+        mode = prompt_mode_choice()
+        
+        if mode == "auto":
+            run_auto_mode()
+        else:
+            run_manual_mode()
+        
+        # После завершения режима спрашиваем о продолжении
+        print(f"\n{Colors.CYAN}{'─' * 60}{Colors.RESET}")
+        if not prompt_yes_no(f"{Colors.BOLD}Продолжить работу?{Colors.RESET}"):
+            print(f"\n{Colors.CYAN}До свидания!{Colors.RESET}")
+            break
 
 
 if __name__ == '__main__':
