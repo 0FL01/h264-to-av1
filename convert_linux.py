@@ -22,6 +22,13 @@ from collections import deque
 DOCKER_IMAGE = "linuxserver/ffmpeg:8.0.1"
 WORTHINESS_THRESHOLD = 0.95
 
+# Кодеки, поддерживаемые Vulkan hwaccel для декодирования (AMD RADV)
+VULKAN_DECODE_CODECS = {'h264', 'hevc', 'h265', 'av1', 'vp9'}
+
+# Аудио кодеки, несовместимые с MKV контейнером в режиме copy
+# (требуют транскодирования в AAC/Opus)
+INCOMPATIBLE_AUDIO_CODECS = {'pcm_mulaw', 'pcm_alaw', 'pcm_s16le', 'pcm_s16be', 'pcm_u8'}
+
 # ANSI цвета для красивого вывода
 class Colors:
     HEADER = '\033[95m'
@@ -46,6 +53,7 @@ class VideoInfo:
     height: int
     fps: float
     size_bytes: int
+    audio_codec: Optional[str] = None  # кодек первого аудиопотока
 
 
 @dataclass
@@ -216,12 +224,14 @@ def get_video_info(file_path: Path) -> Optional[VideoInfo]:
     except json.JSONDecodeError:
         return None
     
-    # Находим видеопоток
+    # Находим видеопоток и аудиопоток
     video_stream = None
+    audio_stream = None
     for stream in data.get('streams', []):
-        if stream.get('codec_type') == 'video':
+        if stream.get('codec_type') == 'video' and video_stream is None:
             video_stream = stream
-            break
+        elif stream.get('codec_type') == 'audio' and audio_stream is None:
+            audio_stream = stream
     
     if not video_stream:
         return None
@@ -250,6 +260,9 @@ def get_video_info(file_path: Path) -> Optional[VideoInfo]:
         if int(den) > 0:
             fps = float(num) / float(den)
     
+    # Получаем кодек аудио (если есть аудиопоток)
+    audio_codec = audio_stream.get('codec_name') if audio_stream else None
+    
     return VideoInfo(
         path=file_path,
         bitrate=bitrate,
@@ -258,7 +271,8 @@ def get_video_info(file_path: Path) -> Optional[VideoInfo]:
         width=int(video_stream.get('width', 0)),
         height=int(video_stream.get('height', 0)),
         fps=fps,
-        size_bytes=int(format_info.get('size', 0))
+        size_bytes=int(format_info.get('size', 0)),
+        audio_codec=audio_codec
     )
 
 
@@ -405,41 +419,72 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     else:
         subtitle_codec = 'copy'  # MKV субтитры копируем как есть
     
+    # Определяем, поддерживает ли Vulkan hwaccel декодирование этого кодека
+    use_vulkan_decode = video_info.codec.lower() in VULKAN_DECODE_CODECS
+    
     # Формируем аргументы ffmpeg (без самого ffmpeg - он в ENTRYPOINT)
-    # Vulkan decode + Vulkan encode pipeline
-    ffmpeg_args = [
-        '-hide_banner',
-        '-init_hw_device', 'vulkan=vk:0',
-        '-filter_hw_device', 'vk',
-        '-hwaccel', 'vulkan',
-        '-hwaccel_output_format', 'vulkan',
-    ]
+    ffmpeg_args = ['-hide_banner']
+    
+    if use_vulkan_decode:
+        # Полный Vulkan pipeline: decode + encode на GPU
+        ffmpeg_args.extend([
+            '-init_hw_device', 'vulkan=vk:0',
+            '-filter_hw_device', 'vk',
+            '-hwaccel', 'vulkan',
+            '-hwaccel_output_format', 'vulkan',
+        ])
+        video_filter = None
+        pipeline_name = "Vulkan decode + encode"
+    else:
+        # Гибридный pipeline: software decode → hwupload → Vulkan encode
+        # Для кодеков типа MJPEG, которые Vulkan не умеет декодировать
+        ffmpeg_args.extend([
+            '-init_hw_device', 'vulkan=vk:0',
+            '-filter_hw_device', 'vk',
+        ])
+        video_filter = 'format=nv12,hwupload'
+        pipeline_name = f"Software decode ({video_info.codec}) + Vulkan encode"
     
     # Путь к файлу будет подставлен Docker runner
     # Здесь placeholder, который заменится
     ffmpeg_args.extend(['-i', '__INPUT__'])
     
+    # Явно маппим только нужные типы потоков.
+    # M4V/MOV файлы могут содержать tmcd, chapters и другие data потоки,
+    # которые несовместимы с MKV или Vulkan pipeline.
+    # Суффикс '?' означает "если есть" — не падать если потока нет.
+    # ВАЖНО: 0:V (большая V) — только "настоящее" видео, БЕЗ attached pics,
+    # thumbnails, cover art. Эти mjpeg картинки нельзя кодировать через Vulkan.
     ffmpeg_args.extend([
-        # Явно маппим только нужные типы потоков.
-        # M4V/MOV файлы могут содержать tmcd, chapters и другие data потоки,
-        # которые несовместимы с MKV или Vulkan pipeline.
-        # Суффикс '?' означает "если есть" — не падать если потока нет.
-        # ВАЖНО: 0:V (большая V) — только "настоящее" видео, БЕЗ attached pics,
-        # thumbnails, cover art. Эти mjpeg картинки нельзя кодировать через Vulkan.
         '-map', '0:V',
         '-map', '0:a?',
         '-map', '0:s?',
         '-map', '0:t?',  # attachments (шрифты) для MKV
         '-map_metadata', '0',
         '-map_chapters', '0',
-        # AV1 Vulkan encoder (полностью на GPU)
+    ])
+    
+    # Добавляем видеофильтр если нужен (для software decode pipeline)
+    if video_filter:
+        ffmpeg_args.extend(['-vf', video_filter])
+    
+    # Определяем параметры аудио (транскодирование несовместимых кодеков)
+    if video_info.audio_codec and video_info.audio_codec.lower() in INCOMPATIBLE_AUDIO_CODECS:
+        audio_args = ['-c:a', 'aac', '-b:a', '128k']
+    else:
+        audio_args = ['-c:a', 'copy']
+    
+    # AV1 Vulkan encoder (полностью на GPU)
+    ffmpeg_args.extend([
         '-c:v', 'av1_vulkan',
         '-b:v', f'{target_br}k',
         '-maxrate', f'{max_br}k',
         '-bufsize', f'{buf_size}k',
         '-g', str(gop_size),
         '-keyint_min', str(keyint_min),
-        '-c:a', 'copy',
+    ])
+    ffmpeg_args.extend(audio_args)
+    ffmpeg_args.extend([
         '-c:s', subtitle_codec,
         '-c:t', 'copy',
         '-progress', 'pipe:1',
@@ -456,7 +501,7 @@ def convert_video(source_path: Path, output_path: Path, video_info: VideoInfo) -
     cmd = [container_input if x == '__INPUT__' else x for x in cmd]
     cmd = [container_output if x == '__OUTPUT__' else x for x in cmd]
     
-    print(f"\n{Colors.GREEN}▶ Начало конвертации (Docker + Vulkan)...{Colors.RESET}\n")
+    print(f"\n{Colors.GREEN}▶ Начало конвертации ({pipeline_name})...{Colors.RESET}\n")
     
     try:
         current_process = subprocess.Popen(
@@ -577,8 +622,8 @@ def print_result(result: ConversionResult, output_path: Path):
 
 
 def is_video_file(path: Path) -> bool:
-    """Проверка, является ли файл видео (mp4/mkv/m4v/mov)"""
-    return path.suffix.lower() in ['.mp4', '.mkv', '.m4v', '.mov']
+    """Проверка, является ли файл видео (mp4/mkv/m4v/mov/avi)"""
+    return path.suffix.lower() in ['.mp4', '.mkv', '.m4v', '.mov', '.avi']
 
 
 def get_video_files(directory: Path) -> list[Path]:
@@ -750,7 +795,7 @@ def main():
         
         if input_path.is_file():
             if not is_video_file(input_path):
-                print(f"{Colors.RED}Файл не является видео (mp4/mkv/m4v/mov): {input_path}{Colors.RESET}")
+                print(f"{Colors.RED}Файл не является видео (mp4/mkv/m4v/mov/avi): {input_path}{Colors.RESET}")
                 continue
             files_to_process = [input_path]
             
@@ -768,7 +813,7 @@ def main():
             files_to_process = get_video_files(input_path)
             
             if not files_to_process:
-                print(f"{Colors.YELLOW}В папке нет видеофайлов (mp4/mkv/m4v/mov){Colors.RESET}")
+                print(f"{Colors.YELLOW}В папке нет видеофайлов (mp4/mkv/m4v/mov/avi){Colors.RESET}")
                 continue
             
             print(f"\n{Colors.BLUE}Найдено видеофайлов: {len(files_to_process)}{Colors.RESET}")
