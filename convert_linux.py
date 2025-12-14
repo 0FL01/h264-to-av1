@@ -12,6 +12,7 @@ import shutil
 import json
 import re
 import math
+import asyncio
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -196,6 +197,33 @@ class DockerFFmpegRunner:
             print(f"{Colors.RED}Ошибка: Docker не найден. Установите Docker.{Colors.RESET}")
             sys.exit(1)
     
+    async def run_ffprobe_async(self, file_path: Path) -> tuple[int, str, str]:
+        """Асинхронный запуск ffprobe через Docker"""
+        volume_mount, container_path = self._map_path_to_container(file_path)
+        
+        cmd = self._get_docker_base_cmd() + [
+            '-v', volume_mount,
+            '--entrypoint', 'ffprobe',
+            self.image,
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format', '-show_streams',
+            container_path
+        ]
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+            stdout = stdout_bytes.decode('utf-8', errors='replace')
+            stderr = stderr_bytes.decode('utf-8', errors='replace')
+            return proc.returncode or 0, stdout, stderr
+        except FileNotFoundError:
+            return 1, '', 'Docker не найден'
+    
     def build_ffmpeg_cmd(
         self,
         source_path: Path,
@@ -238,6 +266,70 @@ def get_video_info(file_path: Path) -> Optional[VideoInfo]:
     
     try:
         data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    
+    # Находим видеопоток и аудиопоток
+    video_stream = None
+    audio_stream = None
+    for stream in data.get('streams', []):
+        if stream.get('codec_type') == 'video' and video_stream is None:
+            video_stream = stream
+        elif stream.get('codec_type') == 'audio' and audio_stream is None:
+            audio_stream = stream
+    
+    if not video_stream:
+        return None
+    
+    format_info = data.get('format', {})
+    
+    # Получаем битрейт (может быть в разных местах)
+    bitrate = 0
+    if 'bit_rate' in video_stream:
+        bitrate = int(video_stream['bit_rate']) // 1000
+    elif 'bit_rate' in format_info:
+        bitrate = int(format_info['bit_rate']) // 1000
+    
+    # Если битрейт не найден, вычисляем из размера файла и длительности
+    if bitrate == 0:
+        duration = float(format_info.get('duration', 0))
+        size = int(format_info.get('size', 0))
+        if duration > 0 and size > 0:
+            bitrate = int((size * 8) / duration / 1000)
+    
+    # Получаем FPS
+    fps = 30.0
+    fps_str = video_stream.get('r_frame_rate', '30/1')
+    if '/' in fps_str:
+        num, den = fps_str.split('/')
+        if int(den) > 0:
+            fps = float(num) / float(den)
+    
+    # Получаем кодек аудио (если есть аудиопоток)
+    audio_codec = audio_stream.get('codec_name') if audio_stream else None
+    
+    return VideoInfo(
+        path=file_path,
+        bitrate=bitrate,
+        duration=float(format_info.get('duration', 0)),
+        codec=video_stream.get('codec_name', 'unknown'),
+        width=int(video_stream.get('width', 0)),
+        height=int(video_stream.get('height', 0)),
+        fps=fps,
+        size_bytes=int(format_info.get('size', 0)),
+        audio_codec=audio_codec
+    )
+
+
+async def get_video_info_async(file_path: Path) -> Optional[VideoInfo]:
+    """Асинхронное получение информации о видеофайле через ffprobe (Docker)"""
+    returncode, stdout, stderr = await docker_runner.run_ffprobe_async(file_path)
+    
+    if returncode != 0:
+        return None
+    
+    try:
+        data = json.loads(stdout)
     except json.JSONDecodeError:
         return None
     
@@ -743,6 +835,115 @@ def analyze_files_for_conversion(
     return to_convert, to_skip
 
 
+async def analyze_files_for_conversion_async(
+    files: list[Path],
+    root_dir: Path,
+    max_workers: int = 0
+) -> tuple[list[FileToConvert], list[SkippedFile]]:
+    """
+    Асинхронный анализ файлов для Auto режима с параллельным запуском ffprobe.
+    Возвращает: (список файлов для конвертации, список пропущенных файлов)
+    
+    Args:
+        files: список путей к видеофайлам
+        root_dir: корневая директория для относительных путей
+        max_workers: максимальное количество параллельных ffprobe (0 = auto по CPU)
+    """
+    if max_workers <= 0:
+        max_workers = os.cpu_count() or 4
+    
+    # Кодеки, которые не нужно конвертировать
+    skip_codecs = {'av1', 'hevc', 'h265'}
+    
+    total = len(files)
+    print(f"\n{Colors.DIM}Анализ {total} файлов (параллельно, до {max_workers} потоков)...{Colors.RESET}")
+    
+    # Счётчик прогресса с блокировкой
+    completed = 0
+    progress_lock = asyncio.Lock()
+    
+    # Семафор для ограничения параллелизма
+    semaphore = asyncio.Semaphore(max_workers)
+    
+    # Результаты анализа: (path, video_info или None, skip_reason или None)
+    AnalysisResult = tuple[Path, Optional[VideoInfo], Optional[str], int]
+    
+    async def analyze_one(file_path: Path) -> AnalysisResult:
+        """Анализ одного файла"""
+        nonlocal completed
+        
+        size_bytes = file_path.stat().st_size if file_path.exists() else 0
+        
+        # Быстрые проверки до ffprobe (не требуют семафора)
+        # Пропускаем файлы, которые уже являются результатом конвертации (-av1.mkv)
+        if file_path.stem.endswith('-av1') and file_path.suffix.lower() == '.mkv':
+            async with progress_lock:
+                completed += 1
+                print(f"\r{Colors.DIM}  Проанализировано: {completed}/{total}{Colors.RESET}", end='', flush=True)
+            return file_path, None, "уже конвертирован (-av1.mkv)", size_bytes
+        
+        # Проверяем, существует ли уже конвертированная версия рядом
+        output_path = generate_output_path(file_path, output_dir=None)
+        if output_path.exists():
+            async with progress_lock:
+                completed += 1
+                print(f"\r{Colors.DIM}  Проанализировано: {completed}/{total}{Colors.RESET}", end='', flush=True)
+            return file_path, None, f"уже есть {output_path.name}", size_bytes
+        
+        # Получаем информацию о видео (требует ffprobe, используем семафор)
+        async with semaphore:
+            video_info = await get_video_info_async(file_path)
+        
+        async with progress_lock:
+            completed += 1
+            print(f"\r{Colors.DIM}  Проанализировано: {completed}/{total}{Colors.RESET}", end='', flush=True)
+        
+        if not video_info:
+            return file_path, None, "не удалось прочитать", size_bytes
+        
+        # Пропускаем уже эффективные кодеки
+        if video_info.codec.lower() in skip_codecs:
+            codec_name = 'AV1' if video_info.codec.lower() == 'av1' else 'HEVC'
+            return file_path, None, f"уже {codec_name}", video_info.size_bytes
+        
+        # Проверяем целесообразность конвертации
+        target_br, _, _ = calculate_av1_bitrate(video_info)
+        if target_br >= int(video_info.bitrate * WORTHINESS_THRESHOLD):
+            return file_path, None, "нецелесообразно (низкий битрейт)", video_info.size_bytes
+        
+        # Файл подходит для конвертации
+        return file_path, video_info, None, video_info.size_bytes
+    
+    # Запускаем все задачи параллельно
+    tasks = [analyze_one(f) for f in files]
+    results: list[AnalysisResult] = await asyncio.gather(*tasks)
+    
+    print()  # Новая строка после прогресса
+    
+    # Обрабатываем результаты
+    to_convert: list[FileToConvert] = []
+    to_skip: list[SkippedFile] = []
+    
+    for file_path, video_info, skip_reason, size_bytes in results:
+        if skip_reason is not None:
+            to_skip.append(SkippedFile(
+                path=file_path,
+                reason=skip_reason,
+                size_bytes=size_bytes
+            ))
+        elif video_info is not None:
+            output_path = generate_output_path(file_path, output_dir=None)
+            target_br, _, _ = calculate_av1_bitrate(video_info)
+            to_convert.append(FileToConvert(
+                path=file_path,
+                video_info=video_info,
+                output_path=output_path,
+                target_bitrate=target_br
+            ))
+    
+    return to_convert, to_skip
+
+
 def print_conversion_plan(
     to_convert: list[FileToConvert],
     to_skip: list[SkippedFile],
@@ -834,8 +1035,10 @@ def run_auto_mode() -> None:
         
         print(f"{Colors.GREEN}Найдено видеофайлов: {len(all_files)}{Colors.RESET}")
         
-        # Анализ файлов
-        to_convert, to_skip = analyze_files_for_conversion(all_files, input_path)
+        # Анализ файлов (асинхронный параллельный)
+        to_convert, to_skip = asyncio.run(
+            analyze_files_for_conversion_async(all_files, input_path)
+        )
         
         # Вывод плана
         print_conversion_plan(to_convert, to_skip, input_path)
